@@ -2,6 +2,7 @@ from collections import defaultdict
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
 
@@ -95,13 +96,65 @@ class NCaltech101Dataset(Dataset):
         return torch.tensor(frames), self.labels[idx]
 
 
+class AugmentedEventDataset(Dataset):
+    """Wraps an event dataset to apply train-time augmentations to binned frames.
+
+    Augmentations operate on the (T, 2, H, W) frame tensor:
+    - Random horizontal flip (p=0.5) — reflects events along width.
+    - Polarity swap (p=0.5) — swaps ON/OFF channels, equivalent to contrast flip.
+    - Random crop with zero-padding — pad by `crop_pad` on all sides, then
+      crop back to (H, W) at a random offset. Preserves event locality while
+      jittering spatial position.
+    """
+
+    def __init__(self, base, augment=True, crop_pad=16,
+                 flip_prob=0.5, polarity_prob=0.5):
+        self.base = base
+        self.augment = augment
+        self.crop_pad = crop_pad
+        self.flip_prob = flip_prob
+        self.polarity_prob = polarity_prob
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        frames, label = self.base[idx]
+        if self.augment:
+            frames = self._augment(frames)
+        return frames, label
+
+    def _augment(self, frames):
+        if torch.rand(1).item() < self.flip_prob:
+            frames = torch.flip(frames, dims=[-1])
+
+        if torch.rand(1).item() < self.polarity_prob:
+            frames = frames[:, [1, 0], :, :]
+
+        pad = self.crop_pad
+        if pad > 0:
+            T, C, H, W = frames.shape
+            padded = F.pad(frames, (pad, pad, pad, pad))
+            top = torch.randint(0, 2 * pad + 1, (1,)).item()
+            left = torch.randint(0, 2 * pad + 1, (1,)).item()
+            frames = padded[:, :, top:top + H, left:left + W]
+
+        return frames
+
+
 class DataModuleNCaltech101:
     def __init__(self, batch_size=32, data_path='./data/ncaltech101',
-                 num_steps=100, seed=42):
+                 num_steps=100, seed=42,
+                 augment_train=False, crop_pad=16,
+                 flip_prob=0.5, polarity_prob=0.5):
         self.batch_size = batch_size
         self.data_path = data_path
         self.num_steps = num_steps
         self.seed = seed
+        self.augment_train = augment_train
+        self.crop_pad = crop_pad
+        self.flip_prob = flip_prob
+        self.polarity_prob = polarity_prob
         self.class_names = []
 
     def get_dataloaders(self, train_split=0.8, subset=None):
@@ -137,12 +190,25 @@ class DataModuleNCaltech101:
         train_set = Subset(dataset, train_indices)
         test_set = Subset(dataset, test_indices)
 
+        if self.augment_train:
+            train_set = AugmentedEventDataset(
+                train_set, augment=True, crop_pad=self.crop_pad,
+                flip_prob=self.flip_prob, polarity_prob=self.polarity_prob,
+            )
+
         print(f"Training set size: {len(train_set)}")
         print(f"Test set size: {len(test_set)}")
+        if self.augment_train:
+            print(
+                f"Train augmentation: flip(p={self.flip_prob}) + "
+                f"polarity(p={self.polarity_prob}) + crop(pad={self.crop_pad})"
+            )
 
         train_loader = DataLoader(train_set, batch_size=self.batch_size,
-                                  shuffle=True, drop_last=True)
+                                  shuffle=True, drop_last=True, num_workers=16, pin_memory=True,
+                          persistent_workers=True)
         test_loader = DataLoader(test_set, batch_size=self.batch_size,
-                                 shuffle=False, drop_last=False)
+                                 shuffle=False, drop_last=False, num_workers=8, pin_memory=True,
+                         persistent_workers=True)
 
         return train_loader, test_loader

@@ -8,51 +8,47 @@ import torch.nn as nn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from caltech101.model import SNNConvClassifier
-from caltech101.data import DataModuleNCaltech101
+from cifar100.model import SNNConvClassifier
+from cifar100.data import DataModuleCIFAR100
 
 
 # --- Experiment selector -------------------------------------------------
-# Phase 3 regression diagnosis: add one change at a time starting from
-# Phase 2 baseline (A) and verify each step doesn't break training.
-# Target: >= 45% test accuracy by epoch 10 (except F — see plan).
+# CIFAR-100 Phase 3: caltech-style interleaved loop, no attention.
+# Add improvements one at a time.
+#
+# Plan:
+#   P (pure baseline): caltech-style, no attn, T=8, 60 epochs
+#   Q (aug):           P + RandAugment + Cutout
+#   R (steps):         Q + T=12
+#   S (skip):          R + SEW-ResNet skip connections (model change needed)
 
-EXPERIMENT = 'G'
+EXPERIMENT = 'P'
 
 EXPERIMENTS = {
-    # letter: (depth, bn_mode, augment_train, crop_pad, spike_reg_weight, n_epochs, label)
-    'A': (3, 'none', False, 0,  1e-3, 10, 'phase2 baseline (32/64/128), num_steps=32'),
-    'B': (4, 'none', False, 0,  1e-3, 10, 'deeper+wider (64/128/256/256), no BN'),
-    'C': (4, 'bntt', False, 0,  1e-3, 10, 'deeper + BNTT'),
-    'D': (4, 'bntt', True,  8,  1e-3, 10, 'deeper + BNTT + mild aug (flip+crop8)'),
-    'E': (4, 'bntt', True,  16, 1e-3, 10, 'deeper + BNTT + full aug'),
-    'F': (4, 'bntt', True,  16, 0.0,  10, 'deeper + BNTT + full aug, no sparsity'),
-    'G': (4, 'bntt', True,  16, 1e-3, 80, 'Phase 3 final: full aug, 80 epochs'),
+    # letter: (num_steps, bn_mode, aug_level, num_epochs, label)
+    'P': (8,  'bntt', 'basic',  60,  'Phase 3 baseline: caltech-style, no attn, T=8'),
+    'Q': (8,  'bntt', 'strong', 60,  'Phase 3 + RandAugment + Cutout'),
+    'R': (12, 'bntt', 'strong', 60,  'Phase 3 + strong aug + T=12'),
 }
 
-depth, bn_mode, augment_train, crop_pad, spike_reg_weight, num_epochs, exp_desc = \
-    EXPERIMENTS[EXPERIMENT]
-EXPERIMENT_NAME = f"phase3_diag_{EXPERIMENT}" if EXPERIMENT != 'G' \
-    else "caltech101_phase3_v2"
+num_steps, bn_mode, aug_level, num_epochs, exp_desc = EXPERIMENTS[EXPERIMENT]
+EXPERIMENT_NAME = f"cifar100_p3_{EXPERIMENT}"
 
 # --- Hyperparameters -----------------------------------------------------
 
 SEED = 42
-num_steps = 32
-batch_size = 16
+batch_size = 128
 beta = 0.95
 lr = 1e-3
-weight_decay = 1e-4
+weight_decay = 5e-4
 label_smoothing = 0.1
+spike_reg_weight = 1e-3
 spike_grad = surrogate.fast_sigmoid()
-
-# For D/E, polarity swap is part of "full aug"; for D (mild) keep it off.
-polarity_prob = 0.5 if (augment_train and crop_pad >= 16) else 0.0
 
 torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Log tee (fix for scrollback getting lost) --------------------------
+# --- Log tee -------------------------------------------------------------
 
 log_dir = PROJECT_ROOT / "logs"
 log_dir.mkdir(exist_ok=True)
@@ -77,36 +73,20 @@ sys.stderr = Tee(sys.__stderr__, log_file)
 
 print(f"=== Experiment {EXPERIMENT}: {exp_desc} ===")
 print(f"Log: {log_path}")
-print(f"depth={depth} bn_mode={bn_mode} augment={augment_train} "
-      f"crop_pad={crop_pad} polarity_prob={polarity_prob} "
-      f"spike_reg={spike_reg_weight}")
+print(f"num_steps={num_steps} bn_mode={bn_mode} aug={aug_level} epochs={num_epochs}")
 
 # --- Data ----------------------------------------------------------------
 
-data_module = DataModuleNCaltech101(
+data_module = DataModuleCIFAR100(
     batch_size=batch_size,
-    data_path=str(PROJECT_ROOT / "data" / "ncaltech101" / "caltech101" / "Caltech101"),
-    num_steps=num_steps,
-    seed=SEED,
-    augment_train=augment_train,
-    crop_pad=crop_pad,
-    polarity_prob=polarity_prob,
+    data_path=str(PROJECT_ROOT / "data" / "cifar-100"),
+    aug_level=aug_level,
 )
-train_loader, test_loader = data_module.get_dataloaders(subset=None)
+train_loader, test_loader = data_module.get_dataloaders()
 num_classes = len(data_module.class_names)
 
-train_wrapper = train_loader.dataset
-train_subset = getattr(train_wrapper, 'base', train_wrapper)  # unwrap augmentation
-train_labels = torch.tensor(
-    [train_subset.dataset.labels[i] for i in train_subset.indices]
-)
-class_counts = torch.bincount(train_labels, minlength=num_classes).float()
-class_weights = class_counts.sum() / (num_classes * class_counts.clamp(min=1))
-class_weights = class_weights.to(device)
-
 print(f"Training on {num_classes} classes")
-print(f"Experiment: {EXPERIMENT_NAME} | Seed: {SEED} | Batch size: {batch_size}")
-print(f"Class count range: {int(class_counts.min())}-{int(class_counts.max())}")
+print(f"Experiment: {EXPERIMENT_NAME} | Seed: {SEED}")
 
 # --- Model ---------------------------------------------------------------
 
@@ -115,13 +95,12 @@ net = SNNConvClassifier(
     num_steps=num_steps,
     beta=beta,
     spike_grad=spike_grad,
-    depth=depth,
     bn_mode=bn_mode,
 ).to(device)
 n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
 print(f"Trainable params: {n_params:,}")
 
-loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
@@ -143,19 +122,18 @@ if checkpoint_path.exists():
 else:
     print("No checkpoint found, starting fresh.")
 
-num_fire_rates = depth + 1
-fire_labels = [f"lif{i+1}" for i in range(depth)] + ["out"]
+fire_labels = ["lif1", "lif2", "lif3", "lif4", "out"]
 
 # --- Training ------------------------------------------------------------
 
 for epoch in range(start_epoch, start_epoch + num_epochs):
     net.train()
     running_ce, running_spike, n_batches = 0.0, 0.0, 0
-    for events, targets in train_loader:
-        events = events.float().to(device).transpose(0, 1)  # [B,T,...] -> [T,B,...]
+    for images, targets in train_loader:
+        images = images.to(device)
         targets = targets.to(device)
 
-        spk_out_rec, logits, fire_rates = net(events)   # logits = mem_out at final step
+        spk_out_rec, logits, fire_rates = net(images)
         ce_loss = loss_fn(logits, targets)
         spike_loss = sum(fire_rates)
         loss_val = ce_loss + spike_reg_weight * spike_loss
@@ -173,23 +151,17 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
 
     # --- Eval ---
     epoch_correct, epoch_total = 0, 0
-    class_correct = [0] * num_classes
-    class_total = [0] * num_classes
-    eval_fire_rates = [0.0] * num_fire_rates
+    eval_fire_rates = [0.0] * 5
     eval_batches = 0
     net.eval()
     with torch.no_grad():
-        for events, targets in test_loader:
-            events = events.float().to(device).transpose(0, 1)
+        for images, targets in test_loader:
+            images = images.to(device)
             targets = targets.to(device)
-            spk_out_rec, logits, fire_rates = net(events)   # logits = mem_out at final step
+            spk_out_rec, logits, fire_rates = net(images)
             _, predicted = logits.max(1)
             epoch_total += targets.size(0)
             epoch_correct += (predicted == targets).sum().item()
-            for target, pred in zip(targets, predicted):
-                class_total[target.item()] += 1
-                if pred.item() == target.item():
-                    class_correct[target.item()] += 1
             for i, fr in enumerate(fire_rates):
                 eval_fire_rates[i] += fr.item()
             eval_batches += 1
@@ -206,15 +178,6 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
         f"  Fire rates ({'/'.join(fire_labels)}): "
         + " ".join(f"{r:.3f}" for r in mean_fire)
     )
-    for class_idx, class_name in enumerate(data_module.class_names):
-        total = class_total[class_idx]
-        if total == 0:
-            continue
-        class_acc = 100 * class_correct[class_idx] / total
-        print(
-            f"  {class_name:<18} {class_correct[class_idx]}/{total} "
-            f"({class_acc:.2f}%)"
-        )
 
     if epoch_acc > best_acc:
         best_acc = epoch_acc
@@ -228,7 +191,6 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
             'experiment_name': EXPERIMENT_NAME,
             'seed': SEED,
             'num_steps': num_steps,
-            'depth': depth,
             'bn_mode': bn_mode,
         }, checkpoint_path)
         print(f">> Best saved at epoch {epoch} (accuracy: {best_acc:.2f}%)")
