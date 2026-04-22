@@ -87,6 +87,7 @@ class SNNConvClassifier(nn.Module):
         mem_out = self.lif_out.init_leaky()
 
         spk_out_rec = []
+        logit_rec = []  # pre-LIF fc output per step, for TET loss
         fire_accum = [x.new_zeros(()) for _ in range(5)]
 
         if record_all:
@@ -113,6 +114,7 @@ class SNNConvClassifier(nn.Module):
             out = self.fc(flat)
             spk_out, mem_out = self.lif_out(out, mem_out)
             spk_out_rec.append(spk_out)
+            logit_rec.append(out)
 
             fire_accum[0] = fire_accum[0] + s1.mean()
             fire_accum[1] = fire_accum[1] + s2.mean()
@@ -127,6 +129,7 @@ class SNNConvClassifier(nn.Module):
                 s4_rec.append(s4.detach())
 
         spk_out_rec = torch.stack(spk_out_rec)
+        logit_rec = torch.stack(logit_rec)  # [T, B, num_classes]
         mean_fire_rates = [f / self.num_steps for f in fire_accum]
 
         if record_all:
@@ -137,6 +140,6 @@ class SNNConvClassifier(nn.Module):
                 'lif4': torch.stack(s4_rec),
                 'out':  spk_out_rec.detach(),
             }
-            return spk_out_rec, mem_out, mean_fire_rates, records
+            return spk_out_rec, mem_out, mean_fire_rates, logit_rec, records
 
-        return spk_out_rec, mem_out, mean_fire_rates
+        return spk_out_rec, mem_out, mean_fire_rates, logit_rec

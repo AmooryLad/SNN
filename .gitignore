@@ -33,3 +33,6 @@ Thumbs.db
 # Logs
 *.log
 runs/
+
+# Rendered visualizations (output videos + annotated stills) — too large for GitHub
+viz/

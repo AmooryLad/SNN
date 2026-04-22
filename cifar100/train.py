@@ -22,13 +22,13 @@ from cifar100.data import DataModuleCIFAR100
 #   R (steps):         Q + T=12
 #   S (skip):          R + SEW-ResNet skip connections (model change needed)
 
-EXPERIMENT = 'P'
+EXPERIMENT = 'Q'
 
 EXPERIMENTS = {
     # letter: (num_steps, bn_mode, aug_level, num_epochs, label)
     'P': (8,  'bntt', 'basic',  60,  'Phase 3 baseline: caltech-style, no attn, T=8'),
-    'Q': (8,  'bntt', 'strong', 60,  'Phase 3 + RandAugment + Cutout'),
-    'R': (12, 'bntt', 'strong', 60,  'Phase 3 + strong aug + T=12'),
+    'Q': (8,  'bntt', 'strong', 80,  'P + TET loss + ATan surrogate + RandAug + Cutout'),
+    'R': (12, 'bntt', 'strong', 80,  'Q + T=12'),
 }
 
 num_steps, bn_mode, aug_level, num_epochs, exp_desc = EXPERIMENTS[EXPERIMENT]
@@ -43,7 +43,7 @@ lr = 1e-3
 weight_decay = 5e-4
 label_smoothing = 0.1
 spike_reg_weight = 1e-3
-spike_grad = surrogate.fast_sigmoid()
+spike_grad = surrogate.atan()
 
 torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -133,8 +133,10 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
         images = images.to(device)
         targets = targets.to(device)
 
-        spk_out_rec, logits, fire_rates = net(images)
-        ce_loss = loss_fn(logits, targets)
+        spk_out_rec, mem_out, fire_rates, logit_rec = net(images)
+        # TET loss: CE applied at every time step, averaged (Deng et al. ICLR 2022).
+        T = logit_rec.size(0)
+        ce_loss = sum(loss_fn(logit_rec[t], targets) for t in range(T)) / T
         spike_loss = sum(fire_rates)
         loss_val = ce_loss + spike_reg_weight * spike_loss
 
@@ -158,7 +160,8 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
         for images, targets in test_loader:
             images = images.to(device)
             targets = targets.to(device)
-            spk_out_rec, logits, fire_rates = net(images)
+            spk_out_rec, mem_out, fire_rates, logit_rec = net(images)
+            logits = logit_rec.mean(dim=0)  # TET-consistent readout
             _, predicted = logits.max(1)
             epoch_total += targets.size(0)
             epoch_correct += (predicted == targets).sum().item()
