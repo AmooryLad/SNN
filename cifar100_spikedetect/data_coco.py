@@ -143,7 +143,8 @@ def build_dataloaders(
         collate_fn=detection_collate, persistent_workers=num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
     )
-    return train_loader, val_loader, train_set.class_names
+    # val_set is always CocoDetectionAdapter (not wrapped), has class_names
+    return train_loader, val_loader, val_set.class_names
 
 
 if __name__ == "__main__":

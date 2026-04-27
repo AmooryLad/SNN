@@ -68,15 +68,22 @@ class SEWBackboneForDetection(nn.Module):
         self.output_indices = (3, 5, 7)  # end of layer2/3/4
         self.out_channels_per_stage = self.OUT_CHANNELS
 
-    def forward(self, x):
+    def forward(self, x, record_spikes=False):
         mem_stem = self.lif_stem.init_leaky()
         block_states = [b.init_state() for b in self.blocks]
         accum = {k: None for k in ('0', '1', '2')}
+
+        # Spike-recording buffers: accumulate spikes per (time, layer) for viz.
+        # layer1 = blocks[1] end, layer2 = blocks[3], layer3 = blocks[5], layer4 = blocks[7]
+        spike_records = {'stem': [], 'layer1': [], 'layer2': [], 'layer3': [], 'layer4': []}
+        viz_indices = {1: 'layer1', 3: 'layer2', 5: 'layer3', 7: 'layer4'}
 
         for t in range(self.num_steps):
             c = self.bn_stem[t](self.conv_stem(x))
             s_stem, mem_stem = self.lif_stem(c, mem_stem)
             s_stem = self.stem_pool(s_stem)
+            if record_spikes:
+                spike_records['stem'].append(s_stem.detach())
 
             h = s_stem
             for i, block in enumerate(self.blocks):
@@ -84,10 +91,17 @@ class SEWBackboneForDetection(nn.Module):
                 if i in self.output_indices:
                     key = str(self.output_indices.index(i))
                     accum[key] = h if accum[key] is None else accum[key] + h
+                if record_spikes and i in viz_indices:
+                    spike_records[viz_indices[i]].append(h.detach())
 
         out = OrderedDict()
         for k in ('0', '1', '2'):
             out[k] = accum[k] / self.num_steps
+
+        if record_spikes:
+            # Stack each layer's per-step tensors: [T, B, C, H, W]
+            stacked = {k: torch.stack(v, dim=0) for k, v in spike_records.items() if v}
+            return out, stacked
         return out
 
     # ----------------------------- weight loaders ---------------------------

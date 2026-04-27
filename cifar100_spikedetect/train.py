@@ -10,6 +10,7 @@ Single-file configuration at top, Tee logger, best-mAP checkpointing,
 AdamW with warmup + cosine schedule, optional AMP.
 """
 
+import copy
 import math
 import sys
 import time
@@ -25,9 +26,61 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from cifar100_spikedetect.model import build_retinanet
 
 
+# --- ModelEMA: exponential moving average of weights for cleaner eval ---
+
+class ModelEMA:
+    """Maintain a shadow copy of `model` with weights = decay * ema + (1-decay) * current.
+    Eval the EMA model rather than the raw training weights -- typically +0.5-1.5 mAP.
+    """
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for e, p in zip(self.ema.parameters(), model.parameters()):
+            e.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+        # Sync buffers (BN running stats, snn.Leaky lazy state)
+        for e, b in zip(self.ema.buffers(), model.buffers()):
+            if e.shape == b.shape and e.dtype == b.dtype:
+                e.copy_(b)
+            else:
+                e.data = b.data.clone()
+
+
+# --- Progressive backbone unfreezing schedule ---------------------------
+
+def set_trainable_backbone_layers(model, n):
+    """Set how many top backbone layer-groups are trainable.
+       n=0 freezes all backbone; n=4 unfreezes everything.
+       layer1=blocks[0..1], layer2=blocks[2..3], layer3=blocks[4..5], layer4=blocks[6..7].
+       Stem is always trainable (random init).
+    """
+    block_cutoff = (4 - n) * 2  # how many blocks (from layer1 forward) to freeze
+    for i, block in enumerate(model.backbone.body.blocks):
+        for p in block.parameters():
+            p.requires_grad = (i >= block_cutoff)
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def progressive_unfreeze_schedule(epoch):
+    """Return how many backbone layer-groups should be unfrozen at this epoch.
+    Schedule: 1→L4 only, 2→+L3, 3→+L2 (matches our prior trainable_backbone_layers=3).
+    L1 stays frozen always — early features are generic + L1 has biggest activations
+    (full unfreeze tipped batch=10+KD over 24 GB memory limit at epoch 8).
+    """
+    if epoch < 2:
+        return 1   # head + L4 only
+    if epoch < 5:
+        return 2   # + L3
+    return 3       # + L2 (cap here — L1 stays frozen for memory + irrelevant features)
+
+
 # --- Experiment config ---------------------------------------------------
 
-EXPERIMENT = "V3_imagenet"
+EXPERIMENT = "V5_kd"
 
 # schema: dataset, epochs, warmup, max_iters, do_eval,
 #         backbone_source, warm_start_ckpt, warm_start_scope, aug_level, label
@@ -50,6 +103,11 @@ EXPERIMENTS = {
               "cifar100_spikedetect_V4_mosaic_best.pth", 'all',
               'strong',
               "V5 = V4 + KD from ANN teacher (enable via USE_KD)"),
+    "V5b_atss": ("coco", 8, 0, None, True,
+                 'imagenet_ann',
+                 "cifar100_spikedetect_V5_kd_best.pth", 'all',
+                 'strong',
+                 "V5b = V5 + ATSS matcher fine-tune (8 epochs, no warmup)"),
     "V6_spiking": ("coco", 15, 2, None, True,
                    'imagenet_ann',
                    "cifar100_spikedetect_V5_kd_best.pth", 'all',
@@ -63,8 +121,9 @@ EXPERIMENTS = {
 EXPERIMENT_NAME = f"cifar100_spikedetect_{EXPERIMENT}"
 
 # --- Feature flags (enable stage-specific code paths) ------------------
-USE_KD = EXPERIMENT in ("V5_kd",)
+USE_KD = EXPERIMENT in ("V5_kd", "V5b_atss")
 USE_SPIKING_HEAD = EXPERIMENT in ("V6_spiking",)
+USE_ATSS = EXPERIMENT in ("V5b_atss",)
 
 
 # --- Hyperparameters -----------------------------------------------------
@@ -85,6 +144,13 @@ else:
     lr_head = 5e-4
     lr_backbone = 5e-5
     use_amp = False
+
+# KD adds an ANN teacher (~37M params) + its own forward activations.
+# With PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True the allocator
+# avoids fragmentation, letting us push batch=16 (was OOM at 12 before).
+if USE_KD:
+    batch_size = 10
+    num_workers = 8
 
 # For V6 (spiking head) use lower LR since we're fine-tuning warmed-up convs
 if USE_SPIKING_HEAD:
@@ -199,6 +265,11 @@ if warm_start_ckpt is not None:
     else:
         print(f"(warning) warm-start ckpt not found: {ws_path}")
 
+# Patch ATSS matcher (V5b only) — must happen after model is built.
+if USE_ATSS:
+    from cifar100_spikedetect.atss import patch_retinanet_with_atss
+    patch_retinanet_with_atss(model, topk=9)
+
 n_total = sum(p.numel() for p in model.parameters())
 n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Total params: {n_total:,}  Trainable: {n_train:,}")
@@ -245,7 +316,15 @@ def lr_lambda(epoch):
 
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-scaler = torch.amp.GradScaler("cuda") if use_amp else None
+# bf16 autocast: wider exponent range than fp16, prevents focal-loss underflow.
+# No GradScaler needed (bf16 gradients don't underflow like fp16 does).
+amp_dtype = torch.bfloat16 if use_amp else None
+nan_skip_counter = 0
+
+# EMA shadow model — track an exponential moving average of weights for eval.
+USE_EMA = True
+ema = ModelEMA(model, decay=0.999) if USE_EMA else None
+print(f"USE_EMA={USE_EMA}  USE_PROGRESSIVE_UNFREEZE=True")
 
 
 # --- Checkpointing ------------------------------------------------------
@@ -258,11 +337,16 @@ best_map = 0.0
 
 if checkpoint_path.exists():
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Prefer raw model weights for training continuation; fall back to EMA
+    raw_state = ckpt.get("raw_model_state_dict") or ckpt["model_state_dict"]
+    model.load_state_dict(raw_state)
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     start_epoch = ckpt["epoch"] + 1
     best_map = ckpt.get("map", 0.0)
+    # Re-init EMA from the freshly loaded raw weights
+    if ema is not None:
+        ema.ema.load_state_dict(ckpt["model_state_dict"])  # primary_state == EMA weights
     print(f"Resumed from epoch {ckpt['epoch']} (mAP: {best_map:.3f})")
 else:
     print("No resume checkpoint — fresh start for this experiment.")
@@ -276,6 +360,13 @@ def move_targets(targets, device):
 
 
 for epoch in range(start_epoch, start_epoch + num_epochs):
+    # Progressive unfreezing — uses ABSOLUTE epoch so resume preserves the
+    # already-unfrozen state (otherwise resume would refreeze L2/L3).
+    n_unfrozen = progressive_unfreeze_schedule(epoch)
+    n_train = set_trainable_backbone_layers(model, n_unfrozen)
+    print(f"--- Epoch {epoch}: unfreezing {n_unfrozen}/4 backbone layer-groups, "
+          f"trainable params {n_train:,} ---")
+
     model.train()
     running = {"classification": 0.0, "bbox_regression": 0.0, "total": 0.0}
     n_batches = 0
@@ -298,7 +389,7 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
                 loss_dict = model(imgs, targets)
                 loss = sum(loss_dict.values())
                 if USE_KD and teacher is not None:
@@ -307,12 +398,6 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
                     kd_loss = feature_kd_loss(s_feats, t_feats)
                     loss = loss + KD_WEIGHT * kd_loss
                     loss_dict["kd"] = kd_loss
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss_dict = model(imgs, targets)
             loss = sum(loss_dict.values())
@@ -322,10 +407,24 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
                 kd_loss = feature_kd_loss(s_feats, t_feats)
                 loss = loss + KD_WEIGHT * kd_loss
                 loss_dict["kd"] = kd_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], grad_clip_norm)
-            optimizer.step()
+
+        # NaN guard: skip backward+step if this batch produced a non-finite loss.
+        # Protects against rare numerical blowups (e.g. focal loss on an outlier).
+        if not torch.isfinite(loss):
+            nan_skip_counter += 1
+            if nan_skip_counter <= 10 or nan_skip_counter % 100 == 0:
+                print(f"  [nan-guard] skipping batch {batch_idx} "
+                      f"(total skipped: {nan_skip_counter})  loss_dict="
+                      f"{ {k: v.item() if torch.isfinite(v) else 'nan' for k, v in loss_dict.items()} }")
+            continue
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], grad_clip_norm)
+        optimizer.step()
+
+        if ema is not None:
+            ema.update(model)
 
         running["classification"] += loss_dict["classification"].item()
         running["bbox_regression"] += loss_dict["bbox_regression"].item()
@@ -353,38 +452,45 @@ for epoch in range(start_epoch, start_epoch + num_epochs):
           f"| LR bb={lr_bb:.2e} head={lr_hd:.2e} | {n_batches} batches in {time.time()-t0:.1f}s")
 
     if do_eval:
-        model.eval()
+        # Eval the EMA model (smoother weights → better mAP) when available
+        eval_model = ema.ema if ema is not None else model
+        eval_model.eval()
+        eval_tag = "EMA" if ema is not None else "raw"
         metric = MeanAveragePrecision(iou_type="bbox", class_metrics=False)
         with torch.no_grad():
             for imgs, targets in val_loader:
                 imgs = [img.to(device, non_blocking=True) for img in imgs]
                 targets = move_targets(targets, device)
                 if use_amp:
-                    with torch.amp.autocast("cuda"):
-                        preds = model(imgs)
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                        preds = eval_model(imgs)
                 else:
-                    preds = model(imgs)
+                    preds = eval_model(imgs)
                 preds_cpu = [{k: v.detach().cpu() for k, v in p.items()} for p in preds]
                 targs_cpu = [{k: v.detach().cpu() for k, v in t.items()} for t in targets]
                 metric.update(preds_cpu, targs_cpu)
         result = metric.compute()
         current_map = float(result["map_50"])
         map_all = float(result["map"])
-        print(f"Epoch {epoch} eval | mAP@50={current_map:.3f}  mAP@[.5:.95]={map_all:.3f}")
+        print(f"Epoch {epoch} eval ({eval_tag}) | mAP@50={current_map:.3f}  mAP@[.5:.95]={map_all:.3f}")
 
         if current_map > best_map:
             best_map = current_map
+            # Save EMA weights as the primary checkpoint (used for eval/inference)
+            primary_state = ema.ema.state_dict() if ema is not None else model.state_dict()
             torch.save({
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": primary_state,
+                "raw_model_state_dict": model.state_dict(),  # also keep raw for resume
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "ema_decay": ema.decay if ema is not None else None,
                 "map": best_map, "map_all": map_all,
                 "classes": class_names,
                 "experiment_name": EXPERIMENT_NAME,
                 "num_steps": num_steps, "img_size": img_size,
                 "dataset": dataset_name,
             }, checkpoint_path)
-            print(f">> Best saved at epoch {epoch} (mAP@50: {best_map:.3f})")
+            print(f">> Best saved at epoch {epoch} (mAP@50: {best_map:.3f}) [{eval_tag}]")
 
 print("Training complete.")
